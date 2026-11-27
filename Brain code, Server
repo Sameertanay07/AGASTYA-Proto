@@ -1,0 +1,820 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <WebServer.h>
+
+// ============================================================
+// NODE C - ESP32 DEVKIT
+// COM PORT: COM8
+// ============================================================
+
+#define WIFI_CHANNEL 1
+
+const char* AP_NAME = "SUBSIDENCE_MONITOR";
+const char* AP_PASSWORD = "12345678";
+
+WebServer server(80);
+
+// ============================================================
+// PACKET STRUCTURE
+// ============================================================
+
+typedef struct {
+  char nodeID[8];
+  uint32_t sequence;
+  uint32_t timestamp;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  float roll;
+  float pitch;
+  float yaw;
+  uint8_t altitudeState;
+  float relativeHeightCM;
+  float baselinePressure;
+} SensorPacket;
+
+// ============================================================
+// NODE DATA
+// ============================================================
+
+struct NodeData {
+  bool received;
+  float gyroX;
+  float gyroY;
+  float gyroZ;
+  float roll;
+  float pitch;
+  uint8_t altitudeState;
+  uint32_t sequence;
+  unsigned long lastReceived;
+};
+
+NodeData nodeA = {};
+NodeData nodeB = {};
+
+// ============================================================
+// RECEIVE CALLBACK
+// ============================================================
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+  if (len != sizeof(SensorPacket)) return;
+  
+  SensorPacket packet;
+  memcpy(&packet, data, sizeof(SensorPacket));
+  
+  if (strcmp(packet.nodeID, "NODE_A") == 0) {
+    nodeA.received = true;
+    nodeA.gyroX = packet.gyroX;
+    nodeA.gyroY = packet.gyroY;
+    nodeA.gyroZ = packet.gyroZ;
+    nodeA.roll = packet.roll;
+    nodeA.pitch = packet.pitch;
+    nodeA.altitudeState = packet.altitudeState;
+    nodeA.sequence = packet.sequence;
+    nodeA.lastReceived = millis();
+    
+    sendToProcessing("A", packet);
+  }
+  else if (strcmp(packet.nodeID, "NODE_B") == 0) {
+    nodeB.received = true;
+    nodeB.gyroX = packet.gyroX;
+    nodeB.gyroY = packet.gyroY;
+    nodeB.gyroZ = packet.gyroZ;
+    nodeB.roll = packet.roll;
+    nodeB.pitch = packet.pitch;
+    nodeB.altitudeState = packet.altitudeState;
+    nodeB.sequence = packet.sequence;
+    nodeB.lastReceived = millis();
+    
+    sendToProcessing("B", packet);
+  }
+}
+
+// ============================================================
+// SEND TO PROCESSING
+// ============================================================
+
+void sendToProcessing(const char* node, SensorPacket &packet) {
+  Serial.print("DATA:");
+  Serial.print(node);
+  Serial.print(":");
+  Serial.print(packet.gyroX, 3);
+  Serial.print(",");
+  Serial.print(packet.gyroY, 3);
+  Serial.print(",");
+  Serial.print(packet.gyroZ, 3);
+  Serial.print(",");
+  Serial.print(packet.roll, 2);
+  Serial.print(",");
+  Serial.print(packet.pitch, 2);
+  Serial.print(",");
+  Serial.print(packet.altitudeState);
+  Serial.print(",");
+  Serial.println(packet.sequence);
+}
+
+// ============================================================
+// GET STATUS STRINGS
+// ============================================================
+
+String getAltitudeStatus(uint8_t state) {
+  if (state == 1) return "INCREASED";
+  if (state == 2) return "DEFORMED";
+  return "NORMAL";
+}
+
+String getNodeStatus(NodeData &node) {
+  if (!node.received) return "WAITING";
+  if (millis() - node.lastReceived > 2000) return "OFFLINE";
+  
+  // Check altitude state
+  if (node.altitudeState == 2) return "CRITICAL";
+  if (node.altitudeState == 1) return "WARNING";
+  
+  // Check tilt
+  float rollChange = fabs(node.roll);
+  float pitchChange = fabs(node.pitch);
+  
+  if (rollChange >= 8.0 || pitchChange >= 5.0) return "CRITICAL";
+  if (rollChange >= 3.0 || pitchChange >= 2.0) return "WARNING";
+  
+  return "STABLE";
+}
+
+// ============================================================
+// WEB PAGE - SPATIAL UI
+// ============================================================
+
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subsidence Monitor</title>
+<style>
+:root {
+  --bg: #0a0a0f;
+  --glass: rgba(255, 255, 255, 0.03);
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #ffffff;
+  --text-dim: rgba(255, 255, 255, 0.5);
+  --green: #00ff88;
+  --orange: #ff8800;
+  --red: #ff0044;
+  --blue: #0088ff;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px;
+  position: relative;
+  overflow-x: hidden;
+}
+
+/* Animated background grid */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: 
+    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 50px 50px;
+  animation: gridMove 20s linear infinite;
+  pointer-events: none;
+}
+
+@keyframes gridMove {
+  0% { transform: translate(0, 0); }
+  100% { transform: translate(50px, 50px); }
+}
+
+/* Floating orbs */
+.orb {
+  position: fixed;
+  border-radius: 50%;
+  filter: blur(80px);
+  opacity: 0.3;
+  pointer-events: none;
+  animation: float 10s ease-in-out infinite;
+}
+
+.orb-1 {
+  width: 300px;
+  height: 300px;
+  background: #0088ff;
+  top: -100px;
+  left: -100px;
+}
+
+.orb-2 {
+  width: 400px;
+  height: 400px;
+  background: #ff0044;
+  bottom: -150px;
+  right: -150px;
+  animation-delay: -5s;
+}
+
+@keyframes float {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(30px, 30px); }
+}
+
+.header {
+  text-align: center;
+  margin: 30px 0;
+  position: relative;
+  z-index: 1;
+}
+
+.header h1 {
+  font-size: 2.5em;
+  font-weight: 300;
+  letter-spacing: 5px;
+  background: linear-gradient(135deg, #fff 0%, #888 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.header .subtitle {
+  color: var(--text-dim);
+  font-size: 0.8em;
+  letter-spacing: 3px;
+  margin-top: 5px;
+}
+
+.container {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 30px;
+  width: 100%;
+  max-width: 1000px;
+  position: relative;
+  z-index: 1;
+}
+
+.card {
+  background: var(--glass);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 30px;
+  width: 400px;
+  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
+}
+
+.card:hover {
+  transform: translateY(-5px);
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+}
+
+.node-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 30px;
+}
+
+.node-title {
+  font-size: 1.2em;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--text);
+}
+
+.node-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: all 0.5s ease;
+}
+
+.node-indicator.stable {
+  background: var(--green);
+  box-shadow: 0 0 20px var(--green);
+}
+
+.node-indicator.warning {
+  background: var(--orange);
+  box-shadow: 0 0 20px var(--orange);
+  animation: pulse 2s infinite;
+}
+
+.node-indicator.critical {
+  background: var(--red);
+  box-shadow: 0 0 20px var(--red);
+  animation: pulse 1s infinite;
+}
+
+.node-indicator.waiting {
+  background: var(--text-dim);
+}
+
+.node-indicator.offline {
+  background: #444;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
+/* ROW 1: GYROSCOPE */
+.gyro-section {
+  margin-bottom: 25px;
+}
+
+.section-label {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 3px;
+  color: var(--text-dim);
+  margin-bottom: 15px;
+}
+
+.gyro-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+
+.gyro-item {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 15px;
+  text-align: center;
+  transition: all 0.3s ease;
+}
+
+.gyro-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.gyro-value {
+  font-size: 1.5em;
+  font-weight: 700;
+  font-family: 'Monaco', 'Courier New', monospace;
+  transition: all 0.3s ease;
+}
+
+.gyro-label {
+  font-size: 0.7em;
+  color: var(--text-dim);
+  margin-top: 5px;
+  letter-spacing: 1px;
+}
+
+/* ROW 2: ALTITUDE STATUS */
+.altitude-section {
+  text-align: center;
+}
+
+.altitude-status {
+  font-size: 2em;
+  font-weight: 700;
+  letter-spacing: 2px;
+  padding: 20px;
+  border-radius: 15px;
+  transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+.altitude-status::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.1), transparent);
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% { left: -100%; }
+  100% { left: 100%; }
+}
+
+.altitude-status.normal {
+  background: rgba(0, 255, 136, 0.1);
+  border: 1px solid rgba(0, 255, 136, 0.3);
+  color: var(--green);
+}
+
+.altitude-status.increased {
+  background: rgba(255, 136, 0, 0.1);
+  border: 1px solid rgba(255, 136, 0, 0.3);
+  color: var(--orange);
+  animation: pulse 2s infinite;
+}
+
+.altitude-status.deformed {
+  background: rgba(255, 0, 68, 0.1);
+  border: 1px solid rgba(255, 0, 68, 0.3);
+  color: var(--red);
+  animation: pulse 1s infinite;
+}
+
+.altitude-status.waiting {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.altitude-status.offline {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid #444;
+  color: #888;
+}
+
+/* SYSTEM STATUS */
+.system-status {
+  margin-top: 40px;
+  text-align: center;
+  font-size: 1.5em;
+  font-weight: 300;
+  letter-spacing: 3px;
+  padding: 20px 40px;
+  border-radius: 15px;
+  background: var(--glass);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  position: relative;
+  z-index: 1;
+  transition: all 0.5s ease;
+}
+
+.system-status.stable {
+  color: var(--green);
+  border-color: rgba(0, 255, 136, 0.3);
+  box-shadow: 0 0 30px rgba(0, 255, 136, 0.1);
+}
+
+.system-status.warning {
+  color: var(--orange);
+  border-color: rgba(255, 136, 0, 0.3);
+  box-shadow: 0 0 30px rgba(255, 136, 0, 0.1);
+  animation: pulse 2s infinite;
+}
+
+.system-status.critical {
+  color: var(--red);
+  border-color: rgba(255, 0, 68, 0.3);
+  box-shadow: 0 0 30px rgba(255, 0, 68, 0.1);
+  animation: pulse 1s infinite;
+}
+
+.system-status.waiting {
+  color: var(--text-dim);
+}
+
+.system-status.offline {
+  color: #888;
+}
+
+/* Mobile Responsive */
+@media (max-width: 768px) {
+  .header h1 {
+    font-size: 1.5em;
+    letter-spacing: 3px;
+  }
+  
+  .container {
+    gap: 20px;
+    padding: 10px;
+  }
+  
+  .card {
+    width: 100%;
+    max-width: 400px;
+    padding: 20px;
+  }
+  
+  .gyro-value {
+    font-size: 1.2em;
+  }
+  
+  .altitude-status {
+    font-size: 1.5em;
+  }
+  
+  .system-status {
+    font-size: 1.2em;
+    margin-top: 30px;
+  }
+}
+
+@media (max-width: 480px) {
+  body {
+    padding: 10px;
+  }
+  
+  .header h1 {
+    font-size: 1.2em;
+  }
+  
+  .card {
+    padding: 15px;
+    border-radius: 15px;
+  }
+  
+  .gyro-item {
+    padding: 10px;
+  }
+  
+  .gyro-value {
+    font-size: 1em;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+
+<div class="header">
+  <h1>SUBSIDENCE MONITOR</h1>
+  <div class="subtitle">REAL-TIME STRUCTURAL ANALYSIS</div>
+</div>
+
+<div class="container">
+
+<!-- NODE A -->
+<div class="card">
+  <div class="node-header">
+    <div class="node-title">NODE A</div>
+    <div id="aIndicator" class="node-indicator waiting"></div>
+  </div>
+  
+  <!-- ROW 1: GYROSCOPE -->
+  <div class="gyro-section">
+    <div class="section-label">Gyroscope</div>
+    <div class="gyro-grid">
+      <div class="gyro-item">
+        <div class="gyro-value" id="aGX">0.000</div>
+        <div class="gyro-label">X-AXIS</div>
+      </div>
+      <div class="gyro-item">
+        <div class="gyro-value" id="aGY">0.000</div>
+        <div class="gyro-label">Y-AXIS</div>
+      </div>
+      <div class="gyro-item">
+        <div class="gyro-value" id="aGZ">0.000</div>
+        <div class="gyro-label">Z-AXIS</div>
+      </div>
+    </div>
+  </div>
+  
+  <!-- ROW 2: ALTITUDE STATUS -->
+  <div class="altitude-section">
+    <div class="section-label">Altitude Status</div>
+    <div id="aAltitudeStatus" class="altitude-status waiting">WAITING</div>
+  </div>
+</div>
+
+<!-- NODE B -->
+<div class="card">
+  <div class="node-header">
+    <div class="node-title">NODE B</div>
+    <div id="bIndicator" class="node-indicator waiting"></div>
+  </div>
+  
+  <!-- ROW 1: GYROSCOPE -->
+  <div class="gyro-section">
+    <div class="section-label">Gyroscope</div>
+    <div class="gyro-grid">
+      <div class="gyro-item">
+        <div class="gyro-value" id="bGX">0.000</div>
+        <div class="gyro-label">X-AXIS</div>
+      </div>
+      <div class="gyro-item">
+        <div class="gyro-value" id="bGY">0.000</div>
+        <div class="gyro-label">Y-AXIS</div>
+      </div>
+      <div class="gyro-item">
+        <div class="gyro-value" id="bGZ">0.000</div>
+        <div class="gyro-label">Z-AXIS</div>
+      </div>
+    </div>
+  </div>
+  
+  <!-- ROW 2: ALTITUDE STATUS -->
+  <div class="altitude-section">
+    <div class="section-label">Altitude Status</div>
+    <div id="bAltitudeStatus" class="altitude-status waiting">WAITING</div>
+  </div>
+</div>
+
+</div>
+
+<!-- SYSTEM STATUS -->
+<div class="system-status waiting" id="systemStatus">
+  SYSTEM: WAITING
+</div>
+
+<script>
+function updateData() {
+  fetch('/data')
+    .then(response => response.json())
+    .then(data => {
+      // NODE A
+      document.getElementById("aGX").innerText = data.A.gx.toFixed(3);
+      document.getElementById("aGY").innerText = data.A.gy.toFixed(3);
+      document.getElementById("aGZ").innerText = data.A.gz.toFixed(3);
+      
+      // Altitude Status (NORMAL/INCREASED/DEFORMED)
+      updateAltitudeStatus("aAltitudeStatus", data.A.altitudeStatus);
+      
+      // Node indicator (STABLE/WARNING/CRITICAL)
+      updateIndicator("aIndicator", data.A.status);
+      
+      // NODE B
+      document.getElementById("bGX").innerText = data.B.gx.toFixed(3);
+      document.getElementById("bGY").innerText = data.B.gy.toFixed(3);
+      document.getElementById("bGZ").innerText = data.B.gz.toFixed(3);
+      
+      // Altitude Status (NORMAL/INCREASED/DEFORMED)
+      updateAltitudeStatus("bAltitudeStatus", data.B.altitudeStatus);
+      
+      // Node indicator (STABLE/WARNING/CRITICAL)
+      updateIndicator("bIndicator", data.B.status);
+      
+      // SYSTEM STATUS
+      let system = data.system;
+      let sysElement = document.getElementById("systemStatus");
+      sysElement.innerText = "SYSTEM: " + system;
+      sysElement.className = "system-status " + system.toLowerCase();
+    });
+}
+
+function updateAltitudeStatus(id, status) {
+  let element = document.getElementById(id);
+  element.innerText = status;
+  element.className = "altitude-status " + status.toLowerCase();
+}
+
+function updateIndicator(id, status) {
+  let element = document.getElementById(id);
+  element.className = "node-indicator " + status.toLowerCase();
+}
+
+setInterval(updateData, 500);
+updateData();
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+// WEB DATA API
+// ============================================================
+
+void handleData() {
+  String statusA = getNodeStatus(nodeA);
+  String statusB = getNodeStatus(nodeB);
+  
+  String systemStatus = "STABLE";
+  
+  if (statusA == "CRITICAL" || statusB == "CRITICAL") {
+    systemStatus = "CRITICAL";
+  }
+  else if (statusA == "WARNING" || statusB == "WARNING") {
+    systemStatus = "WARNING";
+  }
+  else if (statusA == "WAITING" || statusB == "WAITING") {
+    systemStatus = "WAITING";
+  }
+  else if (statusA == "OFFLINE" && statusB == "OFFLINE") {
+    systemStatus = "OFFLINE";
+  }
+  
+  String json = "{";
+  
+  json += "\"A\":{";
+  json += "\"gx\":" + String(nodeA.gyroX, 3);
+  json += ",\"gy\":" + String(nodeA.gyroY, 3);
+  json += ",\"gz\":" + String(nodeA.gyroZ, 3);
+  json += ",\"altitudeStatus\":\"" + getAltitudeStatus(nodeA.altitudeState) + "\"";
+  json += ",\"status\":\"" + statusA + "\"";
+  json += "},";
+  
+  json += "\"B\":{";
+  json += "\"gx\":" + String(nodeB.gyroX, 3);
+  json += ",\"gy\":" + String(nodeB.gyroY, 3);
+  json += ",\"gz\":" + String(nodeB.gyroZ, 3);
+  json += ",\"altitudeStatus\":\"" + getAltitudeStatus(nodeB.altitudeState) + "\"";
+  json += ",\"status\":\"" + statusB + "\"";
+  json += "},";
+  
+  json += "\"system\":\"" + systemStatus + "\"";
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+// ============================================================
+// SETUP FUNCTIONS
+// ============================================================
+
+void setupWebServer() {
+  server.on("/", []() {
+    server.send(200, "text/html", webpage);
+  });
+  
+  server.on("/data", handleData);
+  
+  server.begin();
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_AP_STA);
+  delay(100);
+  
+  WiFi.softAP(AP_NAME, AP_PASSWORD, WIFI_CHANNEL);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  Serial.print("Node C MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("Dashboard IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupESPNow() {
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ERROR: ESP-NOW INIT FAILED");
+    while (true) { delay(1000); }
+  }
+  
+  esp_now_register_recv_cb(onDataRecv);
+  Serial.println("ESP-NOW READY");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("          NODE C - ESP32 DEVKIT");
+  Serial.println("========================================");
+  
+  setupWiFi();
+  setupESPNow();
+  setupWebServer();
+  
+  Serial.println();
+  Serial.println("Dashboard: http://" + WiFi.softAPIP().toString());
+  Serial.println("Waiting for NODE A and NODE B...");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+  server.handleClient();
+}
